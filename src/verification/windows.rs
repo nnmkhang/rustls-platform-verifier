@@ -364,11 +364,11 @@ impl CertificateStore {
             }
         };
 
-        // `CERT_CHAIN_CACHE_END_CERT` is somewhat cargo-culted from Chromium.
-        // `CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY` prevents fetching of OCSP
-        // and CRLs. `CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT` enables
-        // revocation checking of the entire chain.
-        const FLAGS: u32 = CERT_CHAIN_REVOCATION_CHECK_END_CERT | CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT;
+        // `CERT_CHAIN_REVOCATION_CHECK_END_CERT` only checks revocation for end cert.
+        // `CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT` accumulates network retrievals timeouts
+        // to limit network time and improve performance.
+        const FLAGS: u32 = CERT_CHAIN_REVOCATION_CHECK_END_CERT 
+        | CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT;
 
         // Lowering URL retrieval timeout from default 15s to 10s to account for higher internet speeds
         parameters.dwUrlRetrievalTimeout = 10 * 1000;  // milliseconds
