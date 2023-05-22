@@ -55,6 +55,11 @@ pub fn tls_config() -> ClientConfig {
         .with_no_client_auth()
 }
 
+/// Exposed so application can provide a client_cert_resolver
+pub fn verifier_for_platform() -> Arc<dyn rustls::client::ServerCertVerifier> {
+    Arc::new(Verifier::new())
+}
+
 /// Exposed for test usage. Don't use this, use [tls_config] instead.
 ///
 /// This verifier must be exactly equivalent to the verifier used in the `ClientConfig` returned by [tls_config].
