@@ -27,18 +27,18 @@ use crate::windows::{
 use rustls::{client::ServerCertVerifier, Error as TlsError};
 use winapi::{
     shared::{
-        minwindef::{DWORD, FILETIME, TRUE},
+        minwindef::{FILETIME, TRUE},
         ntdef::{LPSTR, VOID},
-        winerror::{CERT_E_CN_NO_MATCH, CERT_E_INVALID_NAME, CRYPT_E_REVOKED},
+        winerror::{CERT_E_CN_NO_MATCH, CERT_E_INVALID_NAME, CRYPT_E_REVOKED, CERT_E_EXPIRED, CERT_E_UNTRUSTEDROOT, CERT_E_WRONG_USAGE},
     },
     um::wincrypt::{
-        self, CertAddEncodedCertificateToStore, CertCloseStore, CertFreeCertificateChain,
+        CertAddEncodedCertificateToStore, CertCloseStore, CertFreeCertificateChain,
         CertFreeCertificateChainEngine, CertFreeCertificateContext, CertGetCertificateChain,
         CertOpenStore, CertSetCertificateContextProperty, CertVerifyCertificateChainPolicy,
-        AUTHTYPE_SERVER, CERT_CHAIN_CACHE_END_CERT, CERT_CHAIN_CONTEXT, CERT_CHAIN_PARA,
+        AUTHTYPE_SERVER, CERT_CHAIN_CONTEXT, CERT_CHAIN_PARA,
         CERT_CHAIN_POLICY_IGNORE_ALL_REV_UNKNOWN_FLAGS, CERT_CHAIN_POLICY_PARA,
-        CERT_CHAIN_POLICY_SSL, CERT_CHAIN_POLICY_STATUS, CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY,
-        CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT, CERT_CONTEXT, CERT_OCSP_RESPONSE_PROP_ID,
+        CERT_CHAIN_POLICY_SSL, CERT_CHAIN_POLICY_STATUS, CERT_CONTEXT, CERT_OCSP_RESPONSE_PROP_ID,
+        CERT_CHAIN_REVOCATION_CHECK_END_CERT, CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT,
         CERT_SET_PROPERTY_IGNORE_PERSIST_ERROR_FLAG, CERT_STORE_ADD_ALWAYS,
         CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG, CERT_STORE_PROV_MEMORY, CERT_USAGE_MATCH,
         CRYPT_DATA_BLOB, CTL_USAGE, SSL_EXTRA_CERT_CHAIN_POLICY_PARA, USAGE_MATCH_TYPE_AND,
@@ -364,13 +364,14 @@ impl CertificateStore {
             }
         };
 
-        // `CERT_CHAIN_CACHE_END_CERT` is somewhat cargo-culted from Chromium.
-        // `CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY` prevents fetching of OCSP
-        // and CRLs. `CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT` enables
-        // revocation checking of the entire chain.
-        const FLAGS: u32 = CERT_CHAIN_CACHE_END_CERT
-            | CERT_CHAIN_REVOCATION_CHECK_CACHE_ONLY
-            | CERT_CHAIN_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT;
+        // `CERT_CHAIN_REVOCATION_CHECK_END_CERT` only checks revocation for end cert.
+        // `CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT` accumulates network retrievals timeouts
+        // to limit network time and improve performance.
+        const FLAGS: u32 = CERT_CHAIN_REVOCATION_CHECK_END_CERT 
+        | CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT;
+
+        // Lowering URL retrieval timeout from default 15s to 10s to account for higher internet speeds
+        parameters.dwUrlRetrievalTimeout = 10 * 1000;  // milliseconds
 
         // SAFETY: `cert` points to a valid certificate context, parameters is valid for reads, `cert_chain` is valid
         // for writes, and the certificate store is valid and initialized.
@@ -392,12 +393,6 @@ impl CertificateStore {
             _ => None,
         })?;
 
-        {
-            // SAFETY: `cert_chain` was just initialized with a valid pointer.
-            let cert_chain: &_ = unsafe { cert_chain.as_ref() };
-            map_trust_error_status(cert_chain.TrustStatus.dwErrorStatus)?;
-        }
-
         Ok(CertChain { inner: cert_chain })
     }
 }
@@ -410,79 +405,6 @@ fn call_with_last_error<T, F: FnMut() -> Option<T>>(mut call: F) -> Result<T, Tl
             std::io::Error::last_os_error().to_string(),
         ))
     }
-}
-
-// Maps a valid `cert_chain.TrustStatus.dwErrorStatus` to a `TLSError`.
-//
-// See Chromium's `MapCertChainErrorStatusToCertStatus` in
-// https://chromium.googlesource.com/chromium/src/net/+/refs/heads/main/cert/cert_verify_proc_win.cc.
-fn map_trust_error_status(unfiltered_status: DWORD) -> Result<(), TlsError> {
-    // Returns true if the only bitflags set in |status| are in |flags|
-    // and at least one of the bitflags in |flags| is set in |status|.
-    #[must_use]
-    fn only_flags_set(status: DWORD, flags: DWORD) -> bool {
-        ((status & !flags) == 0) && ((status & flags) != 0)
-    }
-
-    // Ignore errors related to missing revocation info, so that a network
-    // partition between the client and the CA's OCSP/CRL servers does not
-    // cause the connection to fail.
-    //
-    // Unlike Chromium, we don't differentiate between "no revocation mechanism"
-    // and "unable to check revocation."
-    const UNABLE_TO_CHECK_REVOCATION: DWORD =
-        wincrypt::CERT_TRUST_REVOCATION_STATUS_UNKNOWN | wincrypt::CERT_TRUST_IS_OFFLINE_REVOCATION;
-    let status = unfiltered_status & !UNABLE_TO_CHECK_REVOCATION;
-
-    // If there are no errors, then we're done.
-    if status == wincrypt::CERT_TRUST_NO_ERROR {
-        return Ok(());
-    }
-
-    // Windows may return multiple errors (webpki only returns one). Rustls
-    // only allows a single error to be returned. Group the errors into
-    // classes roughly similar to the ones used by Chromium, and then
-    // choose what to do based on the class.
-
-    // If the certificate is revoked, then return that, ignoring other errors,
-    // as we consider revocation to be super critical.
-    if (status & wincrypt::CERT_TRUST_IS_REVOKED) != 0 {
-        return Err(invalid_certificate(error_messages::REVOKED));
-    }
-
-    if only_flags_set(
-        status,
-        wincrypt::CERT_TRUST_IS_NOT_VALID_FOR_USAGE
-            | wincrypt::CERT_TRUST_CTL_IS_NOT_VALID_FOR_USAGE,
-    ) {
-        return Err(invalid_certificate(error_messages::INVALID_EXTENSIONS));
-    }
-
-    // Otherwise, if there is only one class of error, map that class to
-    //  a well-known error string (for testing and debugging).
-    if only_flags_set(
-        status,
-        wincrypt::CERT_TRUST_IS_NOT_TIME_VALID | wincrypt::CERT_TRUST_CTL_IS_NOT_TIME_VALID,
-    ) {
-        return Err(invalid_certificate(error_messages::EXPIRED));
-    }
-
-    // XXX: winapi doesn't expose this.
-    const CERT_TRUST_IS_EXPLICIT_DISTRUST: DWORD = 0x04000000;
-    if only_flags_set(
-        status,
-        wincrypt::CERT_TRUST_IS_UNTRUSTED_ROOT
-            | CERT_TRUST_IS_EXPLICIT_DISTRUST
-            | wincrypt::CERT_TRUST_IS_PARTIAL_CHAIN,
-    ) {
-        return Err(invalid_certificate(error_messages::UNKNOWN_CERT));
-    }
-
-    // Return an error that contains exactly what Windows told us.
-    Err(invalid_certificate(format!(
-        "Bad certificate chain with Windows error status {}",
-        unfiltered_status
-    )))
 }
 
 #[derive(Default)]
@@ -576,8 +498,19 @@ impl Verifier {
         Err(match win_error {
             CERT_E_CN_NO_MATCH | CERT_E_INVALID_NAME => {
                 invalid_certificate(error_messages::WRONG_NAME)
-            }
-            CRYPT_E_REVOKED => invalid_certificate(error_messages::REVOKED),
+            },
+            CRYPT_E_REVOKED => {
+                invalid_certificate(error_messages::REVOKED)
+            }, 
+            CERT_E_EXPIRED => {
+                invalid_certificate(error_messages::EXPIRED)
+            },
+            CERT_E_UNTRUSTEDROOT => {
+                invalid_certificate(error_messages::UNKNOWN_CERT)
+            },
+            CERT_E_WRONG_USAGE => {
+                invalid_certificate(error_messages::INVALID_EXTENSIONS)
+            },
             error_num => {
                 let err = std::io::Error::from_raw_os_error(error_num);
                 // The included error message has both the description and raw OS error code.
