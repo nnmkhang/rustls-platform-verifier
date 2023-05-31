@@ -18,13 +18,11 @@
 //! [Microsoft's Documentation]: <https://docs.microsoft.com/en-us/windows/win32/api/wincrypt/nf-wincrypt-certgetcertificatechain>
 //! [Microsoft's Example]: <https://docs.microsoft.com/en-us/windows/win32/seccrypto/example-c-program-creating-a-certificate-chain>
 
-use super::{
-    error_messages, invalid_certificate, log_server_cert, unsupported_server_name, ALLOWED_EKUS,
-};
+use super::{log_server_cert, unsupported_server_name, ALLOWED_EKUS};
 use crate::windows::{
     c_void_from_ref, c_void_from_ref_mut, nonnull_from_const_ptr, ZeroedWithSize,
 };
-use rustls::{client::ServerCertVerifier, Error as TlsError};
+use rustls::{client::ServerCertVerifier, CertificateError, Error as TlsError};
 use winapi::{
     shared::{
         minwindef::{FILETIME, TRUE},
@@ -46,6 +44,7 @@ use winapi::{
     },
 };
 
+use rustls::Error::InvalidCertificate;
 use std::{
     convert::TryInto,
     mem::{self, MaybeUninit},
@@ -53,6 +52,7 @@ use std::{
     time::SystemTime,
 };
 
+use crate::verification::invalid_certificate;
 #[cfg(any(test, feature = "ffi-testing", feature = "dbg"))]
 use winapi::um::wincrypt::CERT_CHAIN_ENGINE_CONFIG;
 
@@ -308,7 +308,7 @@ impl CertificateStore {
                 cert.as_ptr(),
                 cert.len()
                     .try_into()
-                    .map_err(|_| TlsError::InvalidCertificateEncoding)?,
+                    .map_err(|_| InvalidCertificate(CertificateError::BadEncoding))?,
                 CERT_STORE_ADD_ALWAYS,
                 &mut cert_context,
             )
@@ -318,7 +318,7 @@ impl CertificateStore {
         // created with the right flags; see the `CertificateStore` docs.
         match (res, nonnull_from_const_ptr(cert_context)) {
             (TRUE, Some(cert)) => Ok(Certificate { inner: cert }),
-            _ => Err(TlsError::InvalidCertificateEncoding),
+            _ => Err(InvalidCertificate(CertificateError::BadEncoding)),
         }
     }
 
@@ -464,9 +464,7 @@ impl Verifier {
             #[allow(clippy::as_conversions)]
             let data = CRYPT_DATA_BLOB {
                 cbData: ocsp_data.len().try_into().map_err(|_| {
-                    invalid_certificate(
-                        "Malformed OCSP response stapled to server certificate".to_string(),
-                    )
+                    invalid_certificate("Malformed OCSP response stapled to server certificate")
                 })?,
                 pbData: ocsp_data.as_ptr() as *mut u8,
             };
@@ -497,19 +495,19 @@ impl Verifier {
         let win_error = status.dwError as i32;
         Err(match win_error {
             CERT_E_CN_NO_MATCH | CERT_E_INVALID_NAME => {
-                invalid_certificate(error_messages::WRONG_NAME)
+                InvalidCertificate(CertificateError::NotValidForName)
             },
             CRYPT_E_REVOKED => {
-                invalid_certificate(error_messages::REVOKED)
+                InvalidCertificate(CertificateError::Revoked)
             }, 
             CERT_E_EXPIRED => {
-                invalid_certificate(error_messages::EXPIRED)
+                InvalidCertificate(CertificateError::Expired)
             },
             CERT_E_UNTRUSTEDROOT => {
-                invalid_certificate(error_messages::UNKNOWN_CERT)
+                InvalidCertificate(CertificateError::UnknownIssuer)
             },
             CERT_E_WRONG_USAGE => {
-                invalid_certificate(error_messages::INVALID_EXTENSIONS)
+                InvalidCertificate(CertificateError::InvalidPurpose)
             },
             error_num => {
                 let err = std::io::Error::from_raw_os_error(error_num);
