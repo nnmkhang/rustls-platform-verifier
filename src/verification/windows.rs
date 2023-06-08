@@ -24,7 +24,7 @@ use super::{
 use crate::windows::{
     c_void_from_ref, c_void_from_ref_mut, nonnull_from_const_ptr, ZeroedWithSize,
 };
-use rustls::{client::ServerCertVerifier, Error as TlsError};
+use rustls::{client::ServerCertVerifier, CertificateError, Error as TlsError};
 use winapi::{
     shared::{
         minwindef::{FILETIME, TRUE},
@@ -46,6 +46,7 @@ use winapi::{
     },
 };
 
+use rustls::Error::InvalidCertificate;
 use std::{
     convert::TryInto,
     mem::{self, MaybeUninit},
@@ -308,7 +309,7 @@ impl CertificateStore {
                 cert.as_ptr(),
                 cert.len()
                     .try_into()
-                    .map_err(|_| TlsError::InvalidCertificateEncoding)?,
+                    .map_err(|_| InvalidCertificate(CertificateError::BadEncoding))?,
                 CERT_STORE_ADD_ALWAYS,
                 &mut cert_context,
             )
@@ -318,7 +319,7 @@ impl CertificateStore {
         // created with the right flags; see the `CertificateStore` docs.
         match (res, nonnull_from_const_ptr(cert_context)) {
             (TRUE, Some(cert)) => Ok(Certificate { inner: cert }),
-            _ => Err(TlsError::InvalidCertificateEncoding),
+            _ => Err(InvalidCertificate(CertificateError::BadEncoding)),
         }
     }
 

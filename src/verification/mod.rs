@@ -58,10 +58,13 @@ fn unsupported_server_name() -> rustls::Error {
     rustls::Error::UnsupportedNameType
 }
 
-// Certificate data error shorthand
+// Unknown certificate error shorthand. Used when we need to construct an "Other" certificate
+// error with a platform specific error message.
 #[cfg(any(windows, target_os = "android", target_os = "macos", target_os = "ios"))]
 fn invalid_certificate(reason: impl Into<String>) -> rustls::Error {
-    rustls::Error::InvalidCertificateData(reason.into())
+    rustls::Error::InvalidCertificate(rustls::CertificateError::Other(std::sync::Arc::from(
+        Box::from(reason.into()),
+    )))
 }
 
 #[cfg(any(windows, target_os = "android"))]
