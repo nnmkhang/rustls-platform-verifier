@@ -27,7 +27,7 @@ use winapi::{
     shared::{
         minwindef::{FILETIME, TRUE},
         ntdef::{LPSTR, VOID},
-        winerror::{CERT_E_CN_NO_MATCH, CERT_E_INVALID_NAME, CRYPT_E_REVOKED, CERT_E_EXPIRED, CERT_E_UNTRUSTEDROOT, CERT_E_WRONG_USAGE},
+        winerror::{CERT_E_CN_NO_MATCH, CERT_E_INVALID_NAME, CRYPT_E_REVOKED},
     },
     um::wincrypt::{
         CertAddEncodedCertificateToStore, CertCloseStore, CertFreeCertificateChain,
@@ -405,6 +405,81 @@ fn call_with_last_error<T, F: FnMut() -> Option<T>>(mut call: F) -> Result<T, Tl
             std::io::Error::last_os_error().to_string(),
         ))
     }
+}
+
+// Maps a valid `cert_chain.TrustStatus.dwErrorStatus` to a `TLSError`.
+//
+// See Chromium's `MapCertChainErrorStatusToCertStatus` in
+// https://chromium.googlesource.com/chromium/src/net/+/refs/heads/main/cert/cert_verify_proc_win.cc.
+fn map_trust_error_status(unfiltered_status: DWORD) -> Result<(), TlsError> {
+    // Returns true if the only bitflags set in |status| are in |flags|
+    // and at least one of the bitflags in |flags| is set in |status|.
+    #[must_use]
+    fn only_flags_set(status: DWORD, flags: DWORD) -> bool {
+        ((status & !flags) == 0) && ((status & flags) != 0)
+    }
+
+    // Ignore errors related to missing revocation info, so that a network
+    // partition between the client and the CA's OCSP/CRL servers does not
+    // cause the connection to fail.
+    //
+    // Unlike Chromium, we don't differentiate between "no revocation mechanism"
+    // and "unable to check revocation."
+    const UNABLE_TO_CHECK_REVOCATION: DWORD =
+        wincrypt::CERT_TRUST_REVOCATION_STATUS_UNKNOWN | wincrypt::CERT_TRUST_IS_OFFLINE_REVOCATION;
+    let status = unfiltered_status & !UNABLE_TO_CHECK_REVOCATION;
+
+    // If there are no errors, then we're done.
+    if status == wincrypt::CERT_TRUST_NO_ERROR {
+        return Ok(());
+    }
+
+    // Windows may return multiple errors (webpki only returns one). Rustls
+    // only allows a single error to be returned. Group the errors into
+    // classes roughly similar to the ones used by Chromium, and then
+    // choose what to do based on the class.
+
+    // If the certificate is revoked, then return that, ignoring other errors,
+    // as we consider revocation to be super critical.
+    if (status & wincrypt::CERT_TRUST_IS_REVOKED) != 0 {
+        return Err(InvalidCertificate(CertificateError::Revoked));
+    }
+
+    if only_flags_set(
+        status,
+        wincrypt::CERT_TRUST_IS_NOT_VALID_FOR_USAGE
+            | wincrypt::CERT_TRUST_CTL_IS_NOT_VALID_FOR_USAGE,
+    ) {
+        return Err(InvalidCertificate(CertificateError::Other(
+            std::sync::Arc::new(super::EkuError),
+        )));
+    }
+
+    // Otherwise, if there is only one class of error, map that class to
+    //  a well-known error string (for testing and debugging).
+    if only_flags_set(
+        status,
+        wincrypt::CERT_TRUST_IS_NOT_TIME_VALID | wincrypt::CERT_TRUST_CTL_IS_NOT_TIME_VALID,
+    ) {
+        return Err(InvalidCertificate(CertificateError::Expired));
+    }
+
+    // XXX: winapi doesn't expose this.
+    const CERT_TRUST_IS_EXPLICIT_DISTRUST: DWORD = 0x04000000;
+    if only_flags_set(
+        status,
+        wincrypt::CERT_TRUST_IS_UNTRUSTED_ROOT
+            | CERT_TRUST_IS_EXPLICIT_DISTRUST
+            | wincrypt::CERT_TRUST_IS_PARTIAL_CHAIN,
+    ) {
+        return Err(InvalidCertificate(CertificateError::UnknownIssuer));
+    }
+
+    // Return an error that contains exactly what Windows told us.
+    Err(invalid_certificate(format!(
+        "Bad certificate chain with Windows error status {}",
+        unfiltered_status
+    )))
 }
 
 #[derive(Default)]
