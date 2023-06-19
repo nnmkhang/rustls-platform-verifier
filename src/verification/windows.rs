@@ -496,19 +496,8 @@ impl Verifier {
         Err(match win_error {
             CERT_E_CN_NO_MATCH | CERT_E_INVALID_NAME => {
                 InvalidCertificate(CertificateError::NotValidForName)
-            },
-            CRYPT_E_REVOKED => {
-                InvalidCertificate(CertificateError::Revoked)
-            }, 
-            CERT_E_EXPIRED => {
-                InvalidCertificate(CertificateError::Expired)
-            },
-            CERT_E_UNTRUSTEDROOT => {
-                InvalidCertificate(CertificateError::UnknownIssuer)
-            },
-            CERT_E_WRONG_USAGE => {
-                InvalidCertificate(CertificateError::InvalidPurpose)
-            },
+            }
+            CRYPT_E_REVOKED => InvalidCertificate(CertificateError::Revoked),
             error_num => {
                 let err = std::io::Error::from_raw_os_error(error_num);
                 // The included error message has both the description and raw OS error code.
