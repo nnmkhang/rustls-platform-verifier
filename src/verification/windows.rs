@@ -39,6 +39,7 @@ use winapi::{
         CERT_CHAIN_POLICY_IGNORE_ALL_REV_UNKNOWN_FLAGS, CERT_CHAIN_POLICY_PARA,
         CERT_CHAIN_POLICY_SSL, CERT_CHAIN_POLICY_STATUS, CERT_CONTEXT, CERT_OCSP_RESPONSE_PROP_ID,
         CERT_CHAIN_REVOCATION_CHECK_END_CERT, CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT,
+        CERT_CHAIN_CACHE_END_CERT,
         CERT_SET_PROPERTY_IGNORE_PERSIST_ERROR_FLAG, CERT_STORE_ADD_ALWAYS,
         CERT_STORE_DEFER_CLOSE_UNTIL_LAST_FREE_FLAG, CERT_STORE_PROV_MEMORY, CERT_USAGE_MATCH,
         CRYPT_DATA_BLOB, CTL_USAGE, SSL_EXTRA_CERT_CHAIN_POLICY_PARA, USAGE_MATCH_TYPE_AND,
@@ -368,8 +369,10 @@ impl CertificateStore {
         // `CERT_CHAIN_REVOCATION_CHECK_END_CERT` only checks revocation for end cert.
         // `CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT` accumulates network retrievals timeouts
         // to limit network time and improve performance.
+        // `CERT_CHAIN_CACHE_END_CERT` common for multiple connections to same server.
         const FLAGS: u32 = CERT_CHAIN_REVOCATION_CHECK_END_CERT 
-        | CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT;
+        | CERT_CHAIN_REVOCATION_ACCUMULATIVE_TIMEOUT
+        | CERT_CHAIN_CACHE_END_CERT;
 
         // Lowering URL retrieval timeout from default 15s to 10s to account for higher internet speeds
         parameters.dwUrlRetrievalTimeout = 10 * 1000;  // milliseconds
